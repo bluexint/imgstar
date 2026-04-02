@@ -1,5 +1,5 @@
 # Imgstar
-
+![Imgstar 主界面](https://img.cdn1.vip/i/69ce57f23c9b2_1775130610.webp)
 Imgstar 是一个基于 Tauri v2 的 Windows 桌面应用，用来管理图片等静态资源的上传、删除、CDN 刷新和 WAF allowlist 同步。仓库采用 Rust + Vue + TypeScript 的 monorepo 结构，后端负责对象存储与 Cloudflare 交互，前端负责配置、预览和操作入口。
 
 ## 关于项目
