@@ -106,4 +106,8 @@ npm.cmd run package:msix
 - `packages/contracts`：前后端共享的类型与契约定义。
 - `src-tauri`：Rust 后端、对象存储、Cloudflare、WAF 和运行时逻辑。
 - `scripts`：Windows 下的环境准备、构建和打包脚本。
+<<<<<<< HEAD
 - `docs`：架构说明和 Windows/MSIX 相关文档。
+=======
+- `docs`：架构说明和 Windows/MSIX 相关文档。
+>>>>>>> 0c56b6a4bbb06e89a3d551d9186491edbbde2f9a
