@@ -1,0 +1,23 @@
+{
+  "name": "imgstar",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/desktop",
+    "packages/contracts"
+  ],
+  "scripts": {
+    "env:setup": "powershell -ExecutionPolicy Bypass -File ./scripts/setup-windows-env.ps1",
+    "env:check": "node -v && npm.cmd -v && rustc --version && cargo --version && npm.cmd --workspace @imgstar/desktop exec tauri -- --version && winapp --help >nul 2>nul",
+    "build": "powershell -ExecutionPolicy Bypass -File ./scripts/build-tauri.ps1",
+    "package:msix": "powershell -ExecutionPolicy Bypass -File ./scripts/package-msix.ps1",
+    "tauri": "tauri",
+    "lint": "npm --workspace @imgstar/desktop run lint",
+    "typecheck": "npm --workspace @imgstar/contracts run typecheck && npm --workspace @imgstar/desktop run typecheck",
+    "test": "npm --workspace @imgstar/desktop run test",
+    "test:unit": "npm --workspace @imgstar/desktop run test:unit",
+    "test:integration": "npm --workspace @imgstar/desktop run test:integration",
+    "test:mock": "npm --workspace @imgstar/desktop run test:mock",
+    "check": "npm run lint && npm run typecheck && npm run test"
+  }
+}

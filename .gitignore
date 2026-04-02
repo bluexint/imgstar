@@ -1,0 +1,19 @@
+# CI-generated contract snapshots (do not commit)
+generated/contracts/
+
+# Local editor state
+.vscode/
+
+# Test output captures
+backend_test_out.txt
+backend_test_out_utf8.txt
+
+# Node workspace artifacts
+node_modules/
+apps/desktop/node_modules/
+packages/contracts/node_modules/
+
+# Build and test outputs
+dist/
+apps/desktop/dist/
+coverage/
