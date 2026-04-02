@@ -251,14 +251,6 @@ const resolveWafCdnScope = (cdnBaseUrl?: string | null): WafCdnScope => {
   }
 };
 
-const buildWafFullUriPrefix = (scope: WafCdnScope): string | undefined => {
-  if (!scope.scheme || !scope.host) {
-    return undefined;
-  }
-
-  return `${scope.scheme}://${scope.host}${buildWafGuardedPathPrefix(scope.pathPrefix)}`;
-};
-
 const isStrictAllowlistPath = (path: string, guardedPrefix: string): boolean => {
   if (!path.startsWith(guardedPrefix)) {
     return false;
@@ -290,27 +282,6 @@ const isStrictAllowlistPath = (path: string, guardedPrefix: string): boolean => 
 
 const buildWafSetLiteral = (values: string[]): string =>
   `{${values.map((value) => quoteWafString(value)).join(" ")}}`;
-
-const buildWafFullUri = (scope: WafCdnScope, normalizedPath: string): string =>
-  `${scope.scheme}://${scope.host}${normalizedPath}`;
-
-const collectWafAllowlistFullUris = (
-  objectKeys: Array<string | undefined | null>,
-  cdnBaseUrl?: string | null
-): string[] => {
-  const scope = resolveWafCdnScope(cdnBaseUrl);
-  const guardedPrefix = buildWafGuardedPathPrefix(scope.pathPrefix);
-  const uniqueUris = new Set<string>();
-
-  for (const value of objectKeys) {
-    const normalized = normalizeWafObjectKey(value, scope.pathPrefix);
-    if (normalized && isStrictAllowlistPath(normalized, guardedPrefix) && scope.scheme && scope.host) {
-      uniqueUris.add(buildWafFullUri(scope, normalized));
-    }
-  }
-
-  return toSortedUnique(uniqueUris);
-};
 
 const collectWafAllowlistPaths = (
   objectKeys: Array<string | undefined | null>,
