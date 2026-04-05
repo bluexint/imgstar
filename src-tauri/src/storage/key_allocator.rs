@@ -410,15 +410,9 @@ impl KeyAllocator {
     format!("object_key:{number}")
   }
 
+  #[allow(deprecated)]
   fn current_reuse_delay_ms(&self) -> u64 {
-    let Some(store) = self.settings_store.as_ref() else {
-      return 0;
-    };
-
-    store
-      .load()
-      .and_then(|settings| settings.reuse_delay_ms)
-      .unwrap_or(900_000)
+    0
   }
 
   fn timestamp_ms() -> u64 {

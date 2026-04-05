@@ -97,10 +97,6 @@ const isValidSettings = (settings: SettingsDraft): boolean => {
     return false;
   }
 
-  if (settings.reuseDelayMs !== undefined && settings.reuseDelayMs < 900000) {
-    return false;
-  }
-
   const zoneId = settings.zoneId?.trim() ?? "";
   const zoneApiToken = settings.zoneApiToken?.trim() ?? "";
   const cdnBaseUrl = settings.cdnBaseUrl?.trim() ?? "";

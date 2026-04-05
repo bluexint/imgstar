@@ -30,7 +30,7 @@ const normalizeReuseDelayMs = (value?: number): number => {
     return DEFAULT_REUSE_DELAY_MS;
   }
 
-  return Math.max(DEFAULT_REUSE_DELAY_MS, Math.round(value));
+  return Math.max(0, Math.round(value));
 };
 
 const withInitializationDefaults = (value: SettingsDraft): SettingsDraft => {

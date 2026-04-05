@@ -42,12 +42,6 @@ impl SettingsService {
       }
     }
 
-    if let Some(reuse_delay_ms) = normalized.reuse_delay_ms {
-      if reuse_delay_ms < DEFAULT_REUSE_DELAY_MS {
-        return Err("INVALID_CONFIG".to_string());
-      }
-    }
-
     let zone_id = normalized.zone_id.as_deref().unwrap_or_default();
     let zone_api_token = normalized.zone_api_token.as_deref().unwrap_or_default();
     let cdn_base_url = normalized.cdn_base_url.as_deref().unwrap_or_default();
@@ -141,6 +135,7 @@ impl SettingsService {
     }
   }
 
+  #[allow(deprecated)]
   fn default_draft() -> SettingsDraft {
     SettingsDraft {
       access_key: String::new(),
@@ -160,6 +155,7 @@ impl SettingsService {
     }
   }
 
+  #[allow(deprecated)]
   fn normalize_for_read(payload: SettingsDraft) -> SettingsDraft {
     let digit_count = payload
       .digit_count
@@ -189,6 +185,7 @@ impl SettingsService {
     }
   }
 
+  #[allow(deprecated)]
   fn normalize_for_save(payload: SettingsDraft) -> SettingsDraft {
     let digit_count = payload.digit_count.or(Some(DEFAULT_DIGIT_COUNT));
 

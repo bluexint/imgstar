@@ -238,6 +238,7 @@ pub struct SettingsDraft {
   #[serde(skip_serializing_if = "Option::is_none")]
   pub digit_count: Option<u32>,
   #[serde(skip_serializing_if = "Option::is_none")]
+  #[deprecated = "兼容字段，已废弃。回收链路在删除与缓存清除请求完成后立即释放编号，不再等待冷却延迟"]
   pub reuse_delay_ms: Option<u64>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub preview_hash_enabled: Option<bool>,
