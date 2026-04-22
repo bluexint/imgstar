@@ -1,14 +1,10 @@
 use crate::contracts::{
-  HookStage,
   KvReadonlyObjectEntry,
-  StorageTargetConfig,
-  UploadFileResult,
-  UploadFileStatus,
-  UploadFileRef,
   UploadEventLevel,
-  UploadEventFilter,
   UploadEventModule,
   UploadEventStatus,
+  UploadFileResult,
+  UploadFileStatus,
   UploadRecyclePayload,
   UploadRecycleResult,
   UploadStartPayload,
@@ -16,32 +12,30 @@ use crate::contracts::{
   UploadStartStatus,
 };
 use crate::domain::logging::center::{LogCenter, LogRecord};
-use crate::runtime::adapter_runtime::AdapterResult;
+use crate::domain::upload::object_upload::ObjectUploadCoordinator;
+use crate::domain::upload::recycle::UploadRecycleCoordinator;
+use crate::domain::upload::support::{context_from_pairs, failed_result};
+use crate::domain::upload::waf_sync::WafAllowlistSync;
 use crate::runtime::adapter_runtime::AdapterRuntime;
 use crate::runtime::plugin_runtime::PluginRuntime;
 use crate::storage::key_allocator::KeyAllocator;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANCELLED_TRACE_TTL_MS: u64 = 3_600_000;
 const MAX_CANCELLED_TRACE_ENTRIES: usize = 4_096;
 
-#[derive(Clone, Debug)]
-struct ProcessedUploadFile {
-  number: String,
-  object_key: String,
-}
-
 #[derive(Clone)]
 pub struct UploadOrchestrator {
-  key_allocator: Arc<KeyAllocator>,
-  adapter_runtime: AdapterRuntime,
-  plugin_runtime: PluginRuntime,
+  #[allow(dead_code)]
+  pub(crate) key_allocator: Arc<KeyAllocator>,
   log_center: LogCenter,
   cancelled_traces: Arc<Mutex<HashMap<String, u64>>>,
+  object_upload: ObjectUploadCoordinator,
+  recycle_coordinator: UploadRecycleCoordinator,
+  waf_allowlist_sync: WafAllowlistSync,
 }
 
 impl UploadOrchestrator {
@@ -51,12 +45,32 @@ impl UploadOrchestrator {
     plugin_runtime: PluginRuntime,
     log_center: LogCenter,
   ) -> Self {
+    let waf_allowlist_sync = WafAllowlistSync::new(
+      key_allocator.clone(),
+      adapter_runtime.clone(),
+      log_center.clone(),
+    );
+    let object_upload = ObjectUploadCoordinator::new(
+      key_allocator.clone(),
+      adapter_runtime.clone(),
+      plugin_runtime,
+      log_center.clone(),
+      waf_allowlist_sync.clone(),
+    );
+    let recycle_coordinator = UploadRecycleCoordinator::new(
+      key_allocator.clone(),
+      adapter_runtime,
+      log_center.clone(),
+      waf_allowlist_sync.clone(),
+    );
+
     Self {
       key_allocator,
-      adapter_runtime,
-      plugin_runtime,
       log_center,
       cancelled_traces: Arc::new(Mutex::new(HashMap::new())),
+      object_upload,
+      recycle_coordinator,
+      waf_allowlist_sync,
     }
   }
 
@@ -121,7 +135,11 @@ impl UploadOrchestrator {
         return failed_result(trace_id, "UPLOAD_CANCELLED", file_results);
       }
 
-      match self.process_single_file(trace_id.as_str(), file, &payload) {
+      let is_cancelled = |candidate: &str| self.is_cancelled(candidate);
+      match self
+        .object_upload
+        .process_single_file(trace_id.as_str(), file, &payload, &is_cancelled)
+      {
         Ok(processed) => {
           file_results.push(UploadFileResult {
             index,
@@ -186,768 +204,11 @@ impl UploadOrchestrator {
   }
 
   pub fn recycle(&self, payload: UploadRecyclePayload) -> UploadRecycleResult {
-    let trace_id = payload
-      .trace_id
-      .clone()
-      .filter(|value| !value.trim().is_empty())
-      .unwrap_or_else(|| self.log_center.new_trace_id());
-
-    let number = payload.number.trim().to_string();
-    let object_key = payload.object_key.trim().to_string();
-    let file_name = payload.file_name.trim().to_string();
-
-    if number.is_empty() || object_key.is_empty() || file_name.is_empty() {
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id.clone(),
-          UploadEventModule::Upload,
-          "upload:recycle_failed",
-          UploadEventLevel::Error,
-          UploadEventStatus::Failed,
-          0,
-          context_from_pairs(vec![
-            ("reason", json!("missing_payload_fields")),
-            ("cleanupStatus", json!("not_started")),
-          ]),
-        )
-        .with_error("UPLOAD_RECYCLE_FAILED", "recycle payload is invalid"),
-      );
-
-      return UploadRecycleResult {
-        trace_id,
-        status: UploadFileStatus::Failed,
-        error: Some("UPLOAD_RECYCLE_FAILED".to_string()),
-        cache_purged: false,
-        waf_synced: false,
-      };
-    }
-
-    self.log_center.emit(LogRecord::new(
-      trace_id.clone(),
-      UploadEventModule::Upload,
-      "upload:recycle_started",
-      UploadEventLevel::Info,
-      UploadEventStatus::Success,
-      0,
-      context_from_pairs(vec![
-        ("file", json!(file_name.clone())),
-        ("number", json!(number.clone())),
-        ("objectKey", json!(object_key.clone())),
-      ]),
-    ));
-
-    if !self.key_allocator.mark_deleted(number.as_str()) {
-      return self.recycle_failed(
-        trace_id,
-        "KEY_NOT_ACTIVE",
-        "number is not in active state",
-        "not_started",
-        false,
-        false,
-      );
-    }
-
-    let (waf_result, waf_allowlist_hash) = self.sync_active_object_allowlist();
-    if !waf_result.success {
-      let rollback_ok = self.key_allocator.restore_active(number.as_str());
-      let error_code = waf_result
-        .error_code
-        .unwrap_or_else(|| "WAF_RULE_SYNC_FAILED".to_string());
-      let error_message = waf_result
-        .error_message
-        .unwrap_or_else(|| "waf object allowlist sync failed".to_string());
-
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id.clone(),
-          UploadEventModule::Upload,
-          "upload:waf_sync_error",
-          UploadEventLevel::Error,
-          UploadEventStatus::Failed,
-          waf_result.response_time,
-          context_from_pairs_with_allowlist_hash(
-            vec![
-              ("file", json!(file_name.clone())),
-              ("number", json!(number.clone())),
-              ("objectKey", json!(object_key.clone())),
-              ("rollbackDelete", json!(rollback_ok)),
-            ],
-            waf_allowlist_hash.as_ref(),
-          ),
-        )
-        .with_error(error_code.clone(), error_message.clone())
-        .with_stack(compact_stack(
-          "waf_sync",
-          error_code.clone(),
-          error_message.clone(),
-        )),
-      );
-
-      return self.recycle_failed(
-        trace_id,
-        error_code.as_str(),
-        error_message.as_str(),
-        if rollback_ok {
-          "rollback_to_active"
-        } else {
-          "rollback_failed"
-        },
-        false,
-        false,
-      );
-    }
-
-    self.log_center.emit(LogRecord::new(
-      trace_id.clone(),
-      UploadEventModule::Upload,
-      "upload:waf_synced",
-      UploadEventLevel::Info,
-      UploadEventStatus::Success,
-      waf_result.response_time,
-      context_from_pairs_with_allowlist_hash(
-        vec![("number", json!(number.clone()))],
-        waf_allowlist_hash.as_ref(),
-      ),
-    ));
-
-    let delete_result = self.adapter_runtime.delete_object(object_key.as_str());
-    if !delete_result.success {
-      let error_code = delete_result
-        .error_code
-        .unwrap_or_else(|| "ADAPTER_SERVER_ERROR".to_string());
-      let error_message = delete_result
-        .error_message
-        .unwrap_or_else(|| "cloud object delete failed".to_string());
-
-      return self.recycle_failed(
-        trace_id,
-        error_code.as_str(),
-        error_message.as_str(),
-        "cloud_delete_failed_waf_blocked",
-        false,
-        true,
-      );
-    }
-
-    let cache_purge_configured = self.adapter_runtime.has_cloudflare_cache_purge_configured();
-    let mut cache_purged = false;
-    if cache_purge_configured {
-      let purge_result = self.adapter_runtime.purge_cdn_cache(object_key.as_str());
-      if !purge_result.success {
-        let error_code = purge_result
-          .error_code
-          .unwrap_or_else(|| "CACHE_PURGE_FAILED".to_string());
-        let error_message = purge_result
-          .error_message
-          .unwrap_or_else(|| "cache purge failed".to_string());
-
-        return self.recycle_failed(
-          trace_id,
-          error_code.as_str(),
-          error_message.as_str(),
-          "cloud_deleted_cache_pending",
-          false,
-          true,
-        );
-      }
-
-      cache_purged = true;
-      self.log_center.emit(LogRecord::new(
-        trace_id.clone(),
-        UploadEventModule::Upload,
-        "upload:cache_purged",
-        UploadEventLevel::Info,
-        UploadEventStatus::Success,
-        purge_result.response_time,
-        context_from_pairs(vec![("number", json!(number.clone()))]),
-      ));
-    }
-
-    let mark_cooling_ok = self.key_allocator.mark_cooling(number.as_str());
-    if !mark_cooling_ok {
-      return self.recycle_failed(
-        trace_id,
-        "KEY_REUSE_CONFLICT",
-        "number recycle cooling transition failed",
-        "state_transition_failed",
-        true,
-        true,
-      );
-    }
-
-    if !self.key_allocator.mark_free_immediately(number.as_str()) {
-      return self.recycle_failed(
-        trace_id,
-        "KEY_REUSE_CONFLICT",
-        "number recycle release transition failed",
-        "state_transition_failed",
-        true,
-        true,
-      );
-    }
-
-    self.log_center.emit(LogRecord::new(
-      trace_id.clone(),
-      UploadEventModule::Upload,
-      "upload:recycle_success",
-      UploadEventLevel::Info,
-      UploadEventStatus::Success,
-      0,
-      context_from_pairs(vec![
-        ("number", json!(number)),
-        ("cleanupStatus", json!("recycled_to_free")),
-      ]),
-    ));
-
-    UploadRecycleResult {
-      trace_id,
-      status: UploadFileStatus::Success,
-      error: None,
-      cache_purged,
-      waf_synced: true,
-    }
-  }
-
-  fn process_single_file(
-    &self,
-    trace_id: &str,
-    file: &UploadFileRef,
-    payload: &UploadStartPayload,
-  ) -> Result<ProcessedUploadFile, String> {
-    if self.is_cancelled(trace_id) {
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id,
-          UploadEventModule::Upload,
-          "upload:task_failed",
-          UploadEventLevel::Warn,
-          UploadEventStatus::Failed,
-          0,
-          context_from_pairs(vec![("cleanupStatus", json!("cancelled"))]),
-        )
-        .with_error("UPLOAD_CANCELLED", "upload cancelled by user"),
-      );
-      return Err("UPLOAD_CANCELLED".to_string());
-    }
-
-    if file.size == 0 || !file.looks_like_image() {
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id,
-          UploadEventModule::Upload,
-          "upload:task_failed",
-          UploadEventLevel::Error,
-          UploadEventStatus::Failed,
-          1,
-          context_from_pairs(vec![("cleanupStatus", json!("not_started"))]),
-        )
-        .with_error("UPLOAD_VALIDATION_FAILED", "file failed backend validation")
-        .with_stack(compact_stack(
-          "validation",
-          "UPLOAD_VALIDATION_FAILED",
-          "file failed backend validation",
-        )),
-      );
-      return Err("UPLOAD_VALIDATION_FAILED".to_string());
-    }
-
-    self.emit_hook_boundary(trace_id, HookStage::PreKey, true, payload.plugin_chain.len());
-    if let Err(error_code) = self
-      .plugin_runtime
-      .execute_stage(HookStage::PreKey, &payload.plugin_chain)
-    {
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id,
-          UploadEventModule::Upload,
-          "upload:hook_error",
-          UploadEventLevel::Error,
-          UploadEventStatus::Failed,
-          2,
-          context_from_pairs(vec![
-            ("stage", json!("pre_key")),
-            ("file", json!(file.name.clone())),
-          ]),
-        )
-        .with_error(error_code.clone(), "pre_key hook failed")
-        .with_stack(compact_stack("pre_key_hook", error_code.clone(), "hook failed")),
-      );
-
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id,
-          UploadEventModule::Upload,
-          "upload:task_failed",
-          UploadEventLevel::Error,
-          UploadEventStatus::Failed,
-          2,
-          context_from_pairs(vec![("cleanupStatus", json!("not_started"))]),
-        )
-        .with_error(error_code.clone(), "upload stopped at pre_key")
-        .with_stack(compact_stack("pre_key_hook", error_code.clone(), "task stopped")),
-      );
-
-      return Err(error_code);
-    }
-    self.emit_hook_boundary(trace_id, HookStage::PreKey, false, payload.plugin_chain.len());
-
-    if self.is_cancelled(trace_id) {
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id,
-          UploadEventModule::Upload,
-          "upload:task_failed",
-          UploadEventLevel::Warn,
-          UploadEventStatus::Failed,
-          2,
-          context_from_pairs(vec![("cleanupStatus", json!("cancelled"))]),
-        )
-        .with_error("UPLOAD_CANCELLED", "upload cancelled by user"),
-      );
-      return Err("UPLOAD_CANCELLED".to_string());
-    }
-
-    let allocation = match self.key_allocator.allocate(file.name.as_str()) {
-      Ok(allocation) => allocation,
-      Err(error_code) => {
-        self.log_center.emit(
-          LogRecord::new(
-            trace_id,
-            UploadEventModule::Upload,
-            "upload:task_failed",
-            UploadEventLevel::Error,
-            UploadEventStatus::Failed,
-            2,
-            context_from_pairs(vec![("cleanupStatus", json!("not_started"))]),
-          )
-          .with_error(error_code.clone(), "key allocation failed")
-          .with_stack(compact_stack("key_allocation", error_code.clone(), "allocator failed")),
-        );
-
-        return Err(error_code);
-      }
-    };
-
-    self.log_center.emit(LogRecord::new(
-      trace_id,
-      UploadEventModule::Upload,
-      "upload:key_allocated",
-      UploadEventLevel::Info,
-      UploadEventStatus::Success,
-      3,
-      context_from_pairs(vec![
-        ("stage", json!("reserved")),
-        ("file", json!(file.name.clone())),
-        ("number", json!(allocation.number.clone())),
-        ("objectKey", json!(allocation.object_key.clone())),
-      ]),
-    ));
-
-    if self.is_cancelled(trace_id) {
-      let rollback_ok = self.key_allocator.release_reserved(allocation.number.as_str());
-
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id,
-          UploadEventModule::Upload,
-          "upload:task_failed",
-          UploadEventLevel::Warn,
-          UploadEventStatus::Failed,
-          3,
-          context_from_pairs(vec![
-            (
-              "cleanupStatus",
-              json!(if rollback_ok { "rolled_back" } else { "rollback_failed" }),
-            ),
-            ("number", json!(allocation.number.clone())),
-          ]),
-        )
-        .with_error("UPLOAD_CANCELLED", "upload cancelled after key allocation"),
-      );
-
-      return Err("UPLOAD_CANCELLED".to_string());
-    }
-
-    self.emit_hook_boundary(trace_id, HookStage::PostKey, true, payload.plugin_chain.len());
-    if let Err(error_code) = self
-      .plugin_runtime
-      .execute_stage(HookStage::PostKey, &payload.plugin_chain)
-    {
-      let rollback_ok = self.key_allocator.release_reserved(allocation.number.as_str());
-
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id,
-          UploadEventModule::Upload,
-          "upload:hook_error",
-          UploadEventLevel::Error,
-          UploadEventStatus::Failed,
-          4,
-          context_from_pairs(vec![
-            ("stage", json!("post_key")),
-            ("file", json!(file.name.clone())),
-            ("objectKey", json!(allocation.object_key.clone())),
-          ]),
-        )
-        .with_error(error_code.clone(), "post_key hook failed")
-        .with_stack(compact_stack("post_key_hook", error_code.clone(), "hook failed")),
-      );
-
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id,
-          UploadEventModule::Upload,
-          "upload:task_failed",
-          UploadEventLevel::Error,
-          UploadEventStatus::Failed,
-          4,
-          context_from_pairs(vec![(
-            "cleanupStatus",
-            json!(if rollback_ok { "rolled_back" } else { "rollback_failed" }),
-          )]),
-        )
-        .with_error(error_code.clone(), "upload stopped at post_key")
-        .with_stack(compact_stack("post_key_hook", error_code.clone(), "task stopped")),
-      );
-
-      return Err(error_code);
-    }
-    self.emit_hook_boundary(trace_id, HookStage::PostKey, false, payload.plugin_chain.len());
-
-    if self.is_cancelled(trace_id) {
-      let rollback_ok = self.key_allocator.release_reserved(allocation.number.as_str());
-
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id,
-          UploadEventModule::Upload,
-          "upload:task_failed",
-          UploadEventLevel::Warn,
-          UploadEventStatus::Failed,
-          4,
-          context_from_pairs(vec![
-            (
-              "cleanupStatus",
-              json!(if rollback_ok { "rolled_back" } else { "rollback_failed" }),
-            ),
-            ("number", json!(allocation.number.clone())),
-          ]),
-        )
-        .with_error("UPLOAD_CANCELLED", "upload cancelled after post_key stage"),
-      );
-
-      return Err("UPLOAD_CANCELLED".to_string());
-    }
-
-    self.log_center.emit(LogRecord::new(
-      trace_id,
-      UploadEventModule::Upload,
-      "upload:adapter_start",
-      UploadEventLevel::Info,
-      UploadEventStatus::Success,
-      5,
-      context_from_pairs(vec![
-        ("adapterName", json!(payload.target.label.clone())),
-        ("file", json!(file.name.clone())),
-        ("target", json!(payload.target.id.clone())),
-        ("objectKey", json!(allocation.object_key.clone())),
-      ]),
-    ));
-
-    let (adapter_result, retry_count) =
-      self.put_object_with_retry(trace_id, file, allocation.object_key.as_str(), &payload.target);
-
-    if !adapter_result.success {
-      let rollback_ok = self.key_allocator.release_reserved(allocation.number.as_str());
-      let error_code = adapter_result
-        .error_code
-        .unwrap_or_else(|| "ADAPTER_SERVER_ERROR".to_string());
-      let error_message = adapter_result
-        .error_message
-        .unwrap_or_else(|| "adapter failed".to_string());
-
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id,
-          UploadEventModule::Upload,
-          "upload:adapter_error",
-          UploadEventLevel::Error,
-          UploadEventStatus::Failed,
-          adapter_result.response_time,
-          context_from_pairs(vec![
-            ("adapterName", json!(payload.target.label.clone())),
-            ("file", json!(file.name.clone())),
-            ("target", json!(payload.target.id.clone())),
-            ("objectKey", json!(allocation.object_key.clone())),
-            ("retryCount", json!(retry_count)),
-          ]),
-        )
-        .with_error(error_code.clone(), error_message.clone())
-        .with_stack(compact_stack(
-          "adapter",
-          error_code.clone(),
-          error_message.clone(),
-        )),
-      );
-
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id,
-          UploadEventModule::Upload,
-          "upload:task_failed",
-          UploadEventLevel::Error,
-          UploadEventStatus::Failed,
-          adapter_result.response_time,
-          context_from_pairs(vec![(
-            "cleanupStatus",
-            json!(if rollback_ok { "rolled_back" } else { "rollback_failed" }),
-          )]),
-        )
-        .with_error(error_code.clone(), "upload failed in adapter stage")
-        .with_stack(compact_stack("adapter", error_code.clone(), error_message.clone())),
-      );
-
-      return Err(error_code);
-    }
-
-    let _ = self.key_allocator.activate(allocation.number.as_str());
-
-    if self.is_cancelled(trace_id) {
-      let rollback_delete_ok = self
-        .adapter_runtime
-        .delete_object(allocation.object_key.as_str())
-        .success;
-      if rollback_delete_ok {
-        let _ = self.key_allocator.release_active(allocation.number.as_str());
-        let _ = self.sync_active_object_allowlist();
-      }
-
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id,
-          UploadEventModule::Upload,
-          "upload:task_failed",
-          UploadEventLevel::Warn,
-          UploadEventStatus::Failed,
-          0,
-          context_from_pairs(vec![
-            (
-              "cleanupStatus",
-              json!(if rollback_delete_ok {
-                "rolled_back"
-              } else {
-                "rollback_failed"
-              }),
-            ),
-            ("number", json!(allocation.number.clone())),
-          ]),
-        )
-        .with_error("UPLOAD_CANCELLED", "upload cancelled after cloud write"),
-      );
-
-      return Err("UPLOAD_CANCELLED".to_string());
-    }
-
-    let (waf_result, waf_allowlist_hash) = self.sync_active_object_allowlist();
-    if !waf_result.success {
-      let rollback_delete_ok = self
-        .adapter_runtime
-        .delete_object(allocation.object_key.as_str())
-        .success;
-      if rollback_delete_ok {
-        let _ = self.key_allocator.release_active(allocation.number.as_str());
-      }
-
-      let error_code = waf_result
-        .error_code
-        .unwrap_or_else(|| "WAF_RULE_SYNC_FAILED".to_string());
-      let error_message = waf_result
-        .error_message
-        .unwrap_or_else(|| "waf object allowlist sync failed".to_string());
-
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id,
-          UploadEventModule::Upload,
-          "upload:waf_sync_error",
-          UploadEventLevel::Error,
-          UploadEventStatus::Failed,
-          waf_result.response_time,
-          context_from_pairs_with_allowlist_hash(
-            vec![
-              ("file", json!(file.name.clone())),
-              ("number", json!(allocation.number.clone())),
-              ("objectKey", json!(allocation.object_key.clone())),
-              ("rollbackDelete", json!(rollback_delete_ok)),
-            ],
-            waf_allowlist_hash.as_ref(),
-          ),
-        )
-        .with_error(error_code.clone(), error_message.clone())
-        .with_stack(compact_stack(
-          "waf_sync",
-          error_code.clone(),
-          error_message.clone(),
-        )),
-      );
-
-      self.log_center.emit(
-        LogRecord::new(
-          trace_id,
-          UploadEventModule::Upload,
-          "upload:task_failed",
-          UploadEventLevel::Error,
-          UploadEventStatus::Failed,
-          waf_result.response_time,
-          context_from_pairs(vec![("cleanupStatus", json!("waf_sync_failed"))]),
-        )
-        .with_error(error_code.clone(), "upload stopped at waf sync stage")
-        .with_stack(compact_stack("waf_sync", error_code.clone(), error_message.clone())),
-      );
-
-      return Err(error_code);
-    }
-
-    self.log_center.emit(LogRecord::new(
-      trace_id,
-      UploadEventModule::Upload,
-      "upload:waf_synced",
-      UploadEventLevel::Info,
-      UploadEventStatus::Success,
-      waf_result.response_time,
-      context_from_pairs_with_allowlist_hash(
-        vec![
-          ("file", json!(file.name.clone())),
-          ("number", json!(allocation.number.clone())),
-          ("objectKey", json!(allocation.object_key.clone())),
-        ],
-        waf_allowlist_hash.as_ref(),
-      ),
-    ));
-
-    self.log_center.emit(LogRecord::new(
-      trace_id,
-      UploadEventModule::Upload,
-      "upload:adapter_success",
-      UploadEventLevel::Info,
-      UploadEventStatus::Success,
-      adapter_result.response_time,
-      context_from_pairs(vec![
-        ("adapterName", json!(payload.target.label.clone())),
-        ("file", json!(file.name.clone())),
-        ("target", json!(payload.target.id.clone())),
-        ("objectKey", json!(allocation.object_key.clone())),
-        ("retryCount", json!(retry_count)),
-      ]),
-    ));
-
-    Ok(ProcessedUploadFile {
-      number: allocation.number,
-      object_key: allocation.object_key,
-    })
+    self.recycle_coordinator.recycle(payload)
   }
 
   pub fn collect_active_object_entries(&self) -> Vec<KvReadonlyObjectEntry> {
-    let active_numbers = self.key_allocator.active_numbers();
-    let mut entries = Vec::with_capacity(active_numbers.len());
-
-    for number in active_numbers {
-      if let Some(object_key) = self.key_allocator.object_key_for_number(number.as_str()) {
-        entries.push(KvReadonlyObjectEntry { number, object_key });
-        continue;
-      }
-
-      if let Some(object_key) = self.find_object_key_from_logs(number.as_str()) {
-        entries.push(KvReadonlyObjectEntry { number, object_key });
-      }
-    }
-
-    entries
-  }
-
-  fn sync_active_object_allowlist(&self) -> (AdapterResult, Option<String>) {
-    let object_keys = self
-      .collect_active_object_entries()
-      .into_iter()
-      .map(|entry| entry.object_key)
-      .collect::<Vec<_>>();
-
-    let allowlist_hash = self
-      .adapter_runtime
-      .waf_allowlist_fingerprint(object_keys.as_slice());
-    let result = self
-      .adapter_runtime
-      .sync_waf_object_allowlist(object_keys.as_slice());
-
-    (result, allowlist_hash)
-  }
-
-  fn find_object_key_from_logs(&self, number: &str) -> Option<String> {
-    self
-      .log_center
-      .list(UploadEventFilter::default())
-      .into_iter()
-      .find_map(|event| {
-        if event.module != UploadEventModule::Upload {
-          return None;
-        }
-
-        if event.event_name != "upload:adapter_success"
-          && event.event_name != "upload:key_allocated"
-        {
-          return None;
-        }
-
-        if event.context.get("number").and_then(Value::as_str) != Some(number) {
-          return None;
-        }
-
-        event
-          .context
-          .get("objectKey")
-          .and_then(Value::as_str)
-          .map(|value| value.to_string())
-      })
-  }
-
-  fn put_object_with_retry(
-    &self,
-    trace_id: &str,
-    file: &UploadFileRef,
-    object_key: &str,
-    target: &StorageTargetConfig,
-  ) -> (AdapterResult, u32) {
-    let max_attempts: u32 = 3;
-    let mut backoff_ms: u64 = 300;
-    let mut attempt: u32 = 0;
-
-    loop {
-      if self.is_cancelled(trace_id) {
-        return (
-          AdapterResult {
-            success: false,
-            response_time: 0,
-            error_code: Some("UPLOAD_CANCELLED".to_string()),
-            error_message: Some("upload cancelled by user".to_string()),
-          },
-          attempt,
-        );
-      }
-
-      let result = self.adapter_runtime.put_object(file, object_key, target);
-      let should_retry = matches!(
-        result.error_code.as_deref(),
-        Some("ADAPTER_NETWORK_ERROR" | "ADAPTER_TIMEOUT" | "ADAPTER_RATE_LIMITED")
-      );
-
-      if result.success || !should_retry || attempt + 1 >= max_attempts {
-        return (result, attempt);
-      }
-
-      thread::sleep(Duration::from_millis(backoff_ms));
-      backoff_ms = (backoff_ms * 2).min(30_000);
-      attempt += 1;
-    }
+    self.waf_allowlist_sync.collect_active_object_entries()
   }
 
   fn mark_cancelled(&self, trace_id: &str) {
@@ -1005,112 +266,6 @@ impl UploadOrchestrator {
       .map(|duration| duration.as_millis() as u64)
       .unwrap_or(0)
   }
-
-  fn recycle_failed(
-    &self,
-    trace_id: String,
-    error_code: &str,
-    error_message: &str,
-    cleanup_status: &str,
-    cache_purged: bool,
-    waf_synced: bool,
-  ) -> UploadRecycleResult {
-    self.log_center.emit(
-      LogRecord::new(
-        trace_id.clone(),
-        UploadEventModule::Upload,
-        "upload:recycle_failed",
-        UploadEventLevel::Error,
-        UploadEventStatus::Failed,
-        0,
-        context_from_pairs(vec![("cleanupStatus", json!(cleanup_status))]),
-      )
-      .with_error(error_code, error_message)
-      .with_stack(compact_stack("recycle", error_code, error_message)),
-    );
-
-    UploadRecycleResult {
-      trace_id,
-      status: UploadFileStatus::Failed,
-      error: Some(error_code.to_string()),
-      cache_purged,
-      waf_synced,
-    }
-  }
-
-  fn emit_hook_boundary(
-    &self,
-    trace_id: &str,
-    stage: HookStage,
-    is_before: bool,
-    plugin_count: usize,
-  ) {
-    let event_name = if is_before {
-      "upload:hook_before_process"
-    } else {
-      "upload:hook_after_process"
-    };
-
-    self.log_center.emit(LogRecord::new(
-      trace_id,
-      UploadEventModule::Upload,
-      event_name,
-      UploadEventLevel::Debug,
-      UploadEventStatus::Success,
-      1,
-      context_from_pairs(vec![
-        (
-          "stage",
-          json!(match stage {
-            HookStage::PreKey => "pre_key",
-            HookStage::PostKey => "post_key",
-          }),
-        ),
-        ("pluginCount", json!(plugin_count)),
-      ]),
-    ));
-  }
-}
-
-fn failed_result(
-  trace_id: String,
-  error_code: &str,
-  file_results: Vec<UploadFileResult>,
-) -> UploadStartResult {
-  UploadStartResult {
-    trace_id,
-    status: UploadStartStatus::Failed,
-    error: Some(error_code.to_string()),
-    files: Some(file_results),
-  }
-}
-
-fn context_from_pairs(entries: Vec<(&str, Value)>) -> HashMap<String, Value> {
-  let mut context = HashMap::new();
-  for (key, value) in entries {
-    context.insert(key.to_string(), value);
-  }
-  context
-}
-
-fn context_from_pairs_with_allowlist_hash(
-  mut entries: Vec<(&str, Value)>,
-  allowlist_hash: Option<&String>,
-) -> HashMap<String, Value> {
-  if let Some(hash) = allowlist_hash {
-    entries.push(("allowlistHash", json!(hash)));
-  }
-
-  context_from_pairs(entries)
-}
-
-fn compact_stack(stage: &str, error_code: impl Into<String>, details: impl Into<String>) -> String {
-  format!(
-    "upload::{} > {} > {}",
-    stage,
-    error_code.into(),
-    details.into()
-  )
 }
 
 #[cfg(test)]
@@ -1136,6 +291,7 @@ mod tests {
   use std::sync::Arc;
   use uuid::Uuid;
 
+  #[allow(deprecated)]
   fn build_orchestrator() -> (UploadOrchestrator, LogCenter) {
     let log_store = Arc::new(LogStore::default());
     let event_bus = EventBus::new(log_store.clone());
@@ -1157,7 +313,7 @@ mod tests {
       region: Some("auto".to_string()),
       key_pattern: None,
       digit_count: Some(9),
-      reuse_delay_ms: Some(900_000),
+      reuse_delay_ms: None,
       preview_hash_enabled: Some(true),
       theme: Some("system".to_string()),
       language: Some("zh-CN".to_string()),

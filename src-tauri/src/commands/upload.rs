@@ -1,4 +1,5 @@
 use crate::app_state::AppState;
+use crate::commands::run_blocking;
 use crate::contracts::{
   UploadQueueSnapshot,
   UploadRecyclePayload,
@@ -13,9 +14,7 @@ pub async fn cmd_upload_start(
   payload: UploadStartPayload,
 ) -> Result<UploadStartResult, String> {
   let orchestrator = state.upload_orchestrator.clone();
-  tauri::async_runtime::spawn_blocking(move || orchestrator.start(payload))
-    .await
-    .map_err(|_| "INTERNAL_ERROR".to_string())
+  run_blocking(move || orchestrator.start(payload)).await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -33,9 +32,7 @@ pub async fn cmd_upload_recycle(
   payload: UploadRecyclePayload,
 ) -> Result<UploadRecycleResult, String> {
   let orchestrator = state.upload_orchestrator.clone();
-  tauri::async_runtime::spawn_blocking(move || orchestrator.recycle(payload))
-    .await
-    .map_err(|_| "INTERNAL_ERROR".to_string())
+  run_blocking(move || orchestrator.recycle(payload)).await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -43,7 +40,7 @@ pub async fn cmd_upload_queue_get_snapshot(
   state: tauri::State<'_, AppState>,
 ) -> Result<UploadQueueSnapshot, String> {
   let upload_queue_store = state.upload_queue_store.clone();
-  tauri::async_runtime::spawn_blocking(move || {
+  run_blocking(move || {
     upload_queue_store.load().map(|snapshot| {
       snapshot.unwrap_or_else(|| UploadQueueSnapshot {
         tasks: vec![],
@@ -52,8 +49,7 @@ pub async fn cmd_upload_queue_get_snapshot(
       })
     })
   })
-  .await
-  .map_err(|_| "INTERNAL_ERROR".to_string())?
+  .await?
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -62,9 +58,7 @@ pub async fn cmd_upload_queue_save_snapshot(
   payload: UploadQueueSnapshot,
 ) -> Result<(), String> {
   let upload_queue_store = state.upload_queue_store.clone();
-  tauri::async_runtime::spawn_blocking(move || upload_queue_store.save(payload))
-    .await
-    .map_err(|_| "INTERNAL_ERROR".to_string())?
+  run_blocking(move || upload_queue_store.save(payload)).await?
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -72,9 +66,7 @@ pub async fn cmd_upload_queue_clear_snapshot(
   state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
   let upload_queue_store = state.upload_queue_store.clone();
-  tauri::async_runtime::spawn_blocking(move || upload_queue_store.clear())
-    .await
-    .map_err(|_| "INTERNAL_ERROR".to_string())?
+  run_blocking(move || upload_queue_store.clear()).await?
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -83,7 +75,5 @@ pub async fn cmd_upload_release_reserved_number(
   number: String,
 ) -> Result<bool, String> {
   let key_allocator = state.key_allocator.clone();
-  tauri::async_runtime::spawn_blocking(move || key_allocator.release_reserved(number.as_str()))
-    .await
-    .map_err(|_| "INTERNAL_ERROR".to_string())
+  run_blocking(move || key_allocator.release_reserved(number.as_str())).await
 }

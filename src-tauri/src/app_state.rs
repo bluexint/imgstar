@@ -51,7 +51,7 @@ impl AppState {
       key_allocator,
       upload_queue_store,
       upload_orchestrator,
-      preview_service: PreviewService,
+      preview_service: PreviewService::new(settings_store.clone()),
       plugin_service: PluginService::new(log_center.clone()),
       settings_service: SettingsService::new(settings_store),
       log_center,

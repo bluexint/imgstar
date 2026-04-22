@@ -147,6 +147,7 @@ mod tests {
   use uuid::Uuid;
 
   #[test]
+  #[allow(deprecated)]
   fn persists_saved_settings_across_reopen() {
     let path = std::env::temp_dir().join(format!("imgstar-settings-persist-{}", Uuid::new_v4()));
     let store = SettingsStore::new_with_path(&path).expect("store should initialize");
@@ -161,7 +162,7 @@ mod tests {
       region: Some("auto".to_string()),
       key_pattern: None,
       digit_count: Some(9),
-      reuse_delay_ms: Some(900_000),
+      reuse_delay_ms: None,
       preview_hash_enabled: Some(true),
       theme: Some("system".to_string()),
       language: Some("zh-CN".to_string()),
@@ -176,6 +177,7 @@ mod tests {
   }
 
   #[test]
+  #[allow(deprecated)]
   fn clears_saved_settings() {
     let path = std::env::temp_dir().join(format!("imgstar-settings-clear-{}", Uuid::new_v4()));
     let store = SettingsStore::new_with_path(&path).expect("store should initialize");
@@ -190,7 +192,7 @@ mod tests {
       region: Some("auto".to_string()),
       key_pattern: None,
       digit_count: Some(9),
-      reuse_delay_ms: Some(900_000),
+      reuse_delay_ms: None,
       preview_hash_enabled: Some(true),
       theme: Some("system".to_string()),
       language: Some("zh-CN".to_string()),

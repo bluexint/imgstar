@@ -26,6 +26,7 @@ fn build_payload(file_name: &str, size: u64) -> UploadStartPayload {
   }
 }
 
+#[allow(deprecated)]
 fn build_configured_state() -> AppState {
   let state = AppState::new();
   state.settings_service.save(SettingsDraft {
@@ -39,7 +40,7 @@ fn build_configured_state() -> AppState {
     region: Some("auto".to_string()),
     key_pattern: None,
     digit_count: Some(9),
-    reuse_delay_ms: Some(900_000),
+    reuse_delay_ms: None,
     preview_hash_enabled: Some(true),
     theme: Some("system".to_string()),
     language: Some("zh-CN".to_string()),

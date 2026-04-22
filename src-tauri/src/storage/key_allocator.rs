@@ -935,7 +935,8 @@ mod tests {
   }
 
   #[test]
-  fn keeps_recycled_number_in_cooling_until_delay_expires() {
+  #[allow(deprecated)]
+  fn releases_recycled_number_immediately_after_cooling_transition() {
     let path = std::env::temp_dir().join(format!("imgstar-key-cooling-{}", Uuid::new_v4()));
     let settings_store = Arc::new(SettingsStore::default());
     settings_store.save(SettingsDraft {
@@ -949,7 +950,7 @@ mod tests {
       region: Some("auto".to_string()),
       key_pattern: None,
       digit_count: Some(9),
-      reuse_delay_ms: Some(900_000),
+      reuse_delay_ms: None,
       preview_hash_enabled: Some(true),
       theme: Some("system".to_string()),
       language: Some("zh-CN".to_string()),
@@ -965,7 +966,7 @@ mod tests {
     assert!(allocator.mark_deleted(allocation.number.as_str()));
     assert!(allocator.mark_cooling(allocation.number.as_str()));
     assert_eq!(allocator.state_of(allocation.number.as_str()), KeyState::Cooling);
-    assert!(!allocator.mark_free(allocation.number.as_str()));
-    assert_eq!(allocator.state_of(allocation.number.as_str()), KeyState::Cooling);
+    assert!(allocator.mark_free_immediately(allocation.number.as_str()));
+    assert_eq!(allocator.state_of(allocation.number.as_str()), KeyState::Free);
   }
 }
